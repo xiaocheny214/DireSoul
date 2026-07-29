@@ -1,5 +1,5 @@
-"""媒体文件领域。"""
+"""媒体资产领域。"""
 
-from windup_app.server.media.model import MediaCategory, MediaUploadInput, MediaUploadResult
+from windup_app.server.media.interface import MediaProcessor, MediaService
 
-__all__ = ["MediaCategory", "MediaUploadInput", "MediaUploadResult"]
+__all__ = ["MediaProcessor", "MediaService"]
