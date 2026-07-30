@@ -1,0 +1,84 @@
+# Windup backend 依赖清单 — 给不用 uv 的同学(推荐仍用 uv sync)
+#
+# 安装(在 backend/ 目录下):
+#   1) 装本工作区四个包(editable):
+#      pip install -e packages/common -e packages/framework -e packages/ai_engine -e packages/app
+#   2) 装第三方依赖:
+#      pip install -r requirements.txt
+#   —— 或一步到位:uv sync
+#
+# 说明:
+#  - onnxruntime 已钉 1.23.x(<1.24)以兼容 macOS Intel(1.24+ 无 x86_64 轮子)。
+#  - 视频抽帧另需系统 ffmpeg(brew install ffmpeg)。
+#  - 抠图模型 u2netp.onnx 首次用时自动下载到 ~/.cache/windup/(国内不可达可手动预置)。
+
+annotated-doc==0.0.4
+annotated-types==0.7.0
+anyio==4.14.2
+certifi==2026.7.22
+charset-normalizer==3.4.9
+click==8.4.2
+colorama==0.4.6 ; sys_platform == 'win32'
+coloredlogs==15.0.1
+distro==1.9.0
+fastapi==0.139.2
+flatbuffers==25.12.19
+greenlet==3.5.4 ; platform_machine == 'AMD64' or platform_machine == 'WIN32' or platform_machine == 'aarch64' or platform_machine == 'amd64' or platform_machine == 'ppc64le' or platform_machine == 'win32' or platform_machine == 'x86_64'
+h11==0.16.0
+httpcore==1.0.9
+httptools==0.8.0
+httpx==0.28.1
+humanfriendly==10.0
+idna==3.18
+jiter==0.16.0
+jsonpatch==1.33
+jsonpointer==3.1.1
+langchain-core==1.5.0
+langchain-openai==1.4.0
+langchain-protocol==0.0.18
+langgraph==1.2.9
+langgraph-checkpoint==4.1.1
+langgraph-prebuilt==1.1.0
+langgraph-sdk==0.4.2
+langsmith==0.10.9
+mpmath==1.3.0
+numpy==2.5.1
+onnxruntime==1.23.2
+openai==2.50.0
+orjson==3.11.9
+ormsgpack==1.12.2
+packaging==26.2
+pillow==12.3.0
+protobuf==7.35.1
+psycopg==3.3.4
+psycopg-binary==3.3.4 ; implementation_name != 'pypy'
+pydantic==2.13.4
+pydantic-core==2.46.4
+pydantic-settings==2.14.2
+pyjwt==2.13.0
+pyreadline3==3.5.6 ; sys_platform == 'win32'
+python-dotenv==1.2.2
+python-multipart==0.0.32
+pyyaml==6.0.3
+qiniu==7.18.0
+regex==2026.7.19
+requests==2.34.2
+requests-toolbelt==1.0.0
+sniffio==1.3.1
+sqlalchemy==2.0.51
+starlette==1.3.1
+sympy==1.14.0
+tenacity==9.1.4
+tiktoken==0.13.0
+tqdm==4.70.0
+typing-extensions==4.16.0
+typing-inspection==0.4.2
+tzdata==2026.3 ; sys_platform == 'win32'
+urllib3==2.7.0
+uuid-utils==0.17.0
+uvicorn==0.51.0
+uvloop==0.22.1 ; platform_python_implementation != 'PyPy' and sys_platform != 'cygwin' and sys_platform != 'win32'
+watchfiles==1.2.0
+websockets==15.0.1
+xxhash==3.8.1
+zstandard==0.25.0
