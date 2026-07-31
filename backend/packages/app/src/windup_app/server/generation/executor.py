@@ -205,11 +205,15 @@ class ActionTaskExecutor:
         generated = self._get_generator().generate(card, action, master, progress)
 
         upload = self._upload or self._upload_frame
+        rms = generated.root_motion or [(0, 0)] * len(generated.frames)
         frames = [
             {"index": i,
              "image_url": upload(_fit_to(png, cons.sprite_w, cons.sprite_h)),
-             "duration_ms": dur}
-            for i, (png, dur) in enumerate(zip(generated.frames, generated.durations))
+             "duration_ms": dur,
+             "root_motion": {"dx": rm[0], "dy": rm[1]}}
+            for i, (png, dur, rm) in enumerate(
+                zip(generated.frames, generated.durations, rms)
+            )
         ]
         return {"type": "character_action", "action_type": input.action_type.value, "frames": frames}
 

@@ -24,7 +24,8 @@
                 └── frames[]      list[CharacterFrame]: 帧列表
                     ├── index     int: 帧序号
                     ├── image_url str: 帧图片 URL
-                    └── duration_ms int | None: 帧时长
+                    ├── duration_ms int | None: 帧时长
+                    └── root_motion dict | None: 位移 {dx, dy}
 
 字段说明
 --------
@@ -97,6 +98,7 @@ class CharacterFrame(BaseModel):
     index: int = Field(ge=0, description="帧序号")
     image_url: str = Field(..., description="帧图片 URL")
     duration_ms: int | None = Field(default=None, gt=0, description="帧时长(毫秒)")
+    root_motion: dict | None = Field(default=None, description="根位移 {dx, dy}")
 
 
 class CharacterAction(BaseModel):

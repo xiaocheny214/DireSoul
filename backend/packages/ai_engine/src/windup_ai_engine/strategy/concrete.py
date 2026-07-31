@@ -24,6 +24,7 @@ from windup_ai_engine.prompt import (
     build_attack_prompt,
     build_idle_prompt,
     build_jump_prompt,
+    build_run_prompt,
     build_walk_prompt,
 )
 from windup_ai_engine.strategy.base import DerivationStrategy
@@ -64,6 +65,7 @@ class VideoFrameStrategy(DerivationStrategy):
             ActionType.JUMP: build_jump_prompt,
             ActionType.IDLE: build_idle_prompt,
             ActionType.ATTACK: build_attack_prompt,
+            ActionType.RUN: build_run_prompt,
         }
         build = builders.get(action.action, build_walk_prompt)
         return build(facing=action.facing)

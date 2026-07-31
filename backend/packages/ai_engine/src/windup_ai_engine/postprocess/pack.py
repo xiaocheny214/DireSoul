@@ -18,6 +18,7 @@ def align_bottom_center(
     fill_h: float = 0.62,
     preserve_lift: bool = False,
     ref_height: float | None = None,
+    resample: int = Image.LANCZOS,
 ) -> list[Image.Image]:
     """按脚线对齐到统一画布,消除逐帧画布漂移(Issue #21)。
 
@@ -68,7 +69,9 @@ def align_bottom_center(
         crop = f.crop(box)
         w = max(1, round(crop.width * scale))
         h = max(1, round(crop.height * scale))
-        crop = crop.resize((w, h), Image.NEAREST)
+        # 插画风(stylize=none)缩放用 LANCZOS 保清晰;像素画在 pixelate 阶段已吸附网格,
+        # 这里传 NEAREST 才不破坏像素边(默认 LANCZOS,像素路线由调用方传 NEAREST)。
+        crop = crop.resize((w, h), resample)
         lift = round((ground - box[3]) * scale) if preserve_lift else 0
         canvas = Image.new("RGBA", (cell, cell), (0, 0, 0, 0))
         canvas.alpha_composite(crop, (cell // 2 - w // 2, int(cell * foot_line) - h - lift))

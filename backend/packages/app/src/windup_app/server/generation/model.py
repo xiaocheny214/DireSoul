@@ -94,6 +94,7 @@ class CharacterActionFrame:
     index: int
     image_url: str
     duration_ms: int | None = None
+    root_motion: dict | None = None  # {dx, dy} 逐帧位移(像素,y 向上为正);引擎/前端据此驱动移动
 
 
 @dataclass

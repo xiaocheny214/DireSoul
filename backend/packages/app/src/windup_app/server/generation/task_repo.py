@@ -147,6 +147,7 @@ def _deserialize_result(
                 index=f["index"],
                 image_url=f["image_url"],
                 duration_ms=f.get("duration_ms"),
+                root_motion=f.get("root_motion"),
             )
             for f in raw.get("frames", [])
         ]

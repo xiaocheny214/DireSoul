@@ -40,6 +40,19 @@ async def _lifespan(app: FastAPI):
 
 def create_app() -> FastAPI:
     app = FastAPI(title="windup", version="0.1.0", lifespan=_lifespan)
+    # 前端(vite dev 5173 / preview 4173)跨域访问本 API;紧起时放开本地来源。
+    from fastapi.middleware.cors import CORSMiddleware
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[
+            "http://localhost:4173", "http://127.0.0.1:4173",
+            "http://localhost:5173", "http://127.0.0.1:5173",
+        ],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
     app.include_router(project_router)
     app.include_router(character_router)
     app.include_router(media_router)

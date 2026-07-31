@@ -33,6 +33,9 @@ class GeneratedAction:
 
     frames: list[bytes] = field(default_factory=list)   # RGBA PNG,按播放序
     durations: list[int] = field(default_factory=list)  # 逐帧时长(ms),与 frames 等长
+    # 逐帧 root motion (dx, dy) 位移(像素,y 向上为正),与 frames 等长。序列帧本身原地对齐,
+    # 位移作为独立轨道交给引擎驱动移动(walk/run 的 dx、jump 的 dy);idle 近似全 0。
+    root_motion: list[tuple[int, int]] = field(default_factory=list)
     fps: int = 10
 
 

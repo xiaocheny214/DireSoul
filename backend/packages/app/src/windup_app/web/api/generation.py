@@ -93,6 +93,24 @@ def _task_to_out(task: GenerationTask) -> GenerationTaskOut:
 # ── 端点 ─────────────────────────────────────────────────────────────────────
 
 
+def _resolve_image_size(
+    session: Session, body: CharacterImageGenerateRequest,
+) -> tuple[int, int]:
+    """解析图片生成尺寸:调用方未显式传 width/height 时回退到项目 sprite 尺寸,
+    避免 Pydantic 默认值(1024)与项目实际约束(如 256)冲突而被误判为不一致。"""
+    if body.project_id is None:
+        return body.width, body.height
+    from windup_app.server.project.service import SqlAlchemyProjectService
+
+    project = SqlAlchemyProjectService().get_project(session, body.project_id)
+    if project is None:
+        return body.width, body.height
+    fields_set = body.model_fields_set
+    width = body.width if "width" in fields_set else project.sprite_width
+    height = body.height if "height" in fields_set else project.sprite_height
+    return width, height
+
+
 def _validate_project_size(session: Session, project_id: int | None, width: int, height: int) -> None:
     """校验输入尺寸与项目约束是否一致;不一致则抛异常。"""
     if project_id is None:
@@ -116,13 +134,14 @@ def submit_image_generation(
     session: Session = Depends(get_session),
 ) -> Response[GenerationTaskOut]:
     """提交角色图片生成任务:建 PENDING 记录立即返回,实际图生图后台跑。"""
-    _validate_project_size(session, body.project_id, body.width, body.height)
+    width, height = _resolve_image_size(session, body)
+    _validate_project_size(session, body.project_id, width, height)
     input_data = CharacterImageInput(
         reference_image_url=body.reference_image_url,
         prompt=body.prompt,
         negative_prompt=body.negative_prompt,
-        width=body.width,
-        height=body.height,
+        width=width,
+        height=height,
         num_images=body.num_images,
     )
     task = generation_service.generate_character_image(
