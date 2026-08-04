@@ -19,6 +19,7 @@ from windup_app.web.api.character import router as character_router
 from windup_app.web.api.generation import router as generation_router
 from windup_app.web.api.media import router as media_router
 from windup_app.web.api.project import router as project_router
+from windup_app.web.sse.stream import router as sse_router
 from windup_app.web.handler.exception_handlers import register_exception_handlers
 
 
@@ -68,6 +69,7 @@ def create_app() -> FastAPI:
     app.include_router(character_router)
     app.include_router(media_router)
     app.include_router(generation_router)
+    app.include_router(sse_router)   # 生成任务 SSE 推送（Refs #78）
     # 生成后台调度器注入 app.state:bootstrap(composition root)持有 ai_engine 依赖,
     # web 端运行期从 request.app.state 取,避免 web 静态 import ai_engine(入口层门禁)。
     app.state.run_action_task = run_action_task
