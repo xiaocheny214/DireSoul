@@ -1,0 +1,29 @@
+---
+description: Windup 后端 monorepo 分层与核心约定
+globs: backend/**/*.py
+alwaysApply: false
+---
+
+# Windup 后端架构
+
+uv workspace,四个包(**不是** foundation/workflow/result,那是概念名):
+- `windup_common` — 跨层 DTO/枚举/异常/`Response[T]`(`packages/common`)
+- `windup_framework` — config/db + `providers`(image/video/matte,Protocol 契约)(`packages/framework`)
+- `windup_ai_engine` — `ports → strategy → slicing/postprocess/prompt`,**无存储/DB,只出 bytes**(`packages/ai_engine`)
+- `windup_app` — `server`(域)+ `web`(路由)+ `worker` + `bootstrap`(`packages/app`)
+
+## 分层门禁(import-linter,CI 强制 `lint-imports`)
+- 依赖链:`app.bootstrap → app.web|worker → app.server → ai_engine → framework → common`
+- **入口层(web/worker)禁止直连 ai_engine**,必须经 `app.server`
+- 改动后跑 `.venv/bin/lint-imports` 必须两条契约都 KEPT
+
+## 约定(违反前先读对应文件的 docstring,里面记着实测挣得的原因)
+- **异常分层**:web/service 层用 `Response[T]` + `BizException`;**ai_engine 层直接抛类型化异常**(`ValueError`/`MasterRejected`/`NotImplementedError`),不用 `Response`
+- 受限取值一律用**枚举**(见 `common/models/character.py`);pydantic `extra="forbid"`
+- **不给"没测/没实现"留缺省**:没实现的枚举值/字段=死代码(参考被删的 `fps`/`loop`/`GenRoute.PROC_IDLE`)
+- provider 只可配**型号**,不可配请求形状(那是模型 API 事实,写死在 `providers/sufy.py`)
+- 生成任务:web 建 PENDING 记录 → `after_commit` 派发到 `GenerationDispatcher`(单线程串行)→ `executor` 后台跑 → `task_repo` 落库 + SSE
+
+## 环境
+- 解释器 `backend/.venv/bin/python`;lint `.venv/bin/ruff check`(默认不查 E501)
+- 测试离线可跑:`executor` 依赖全可注入(generator/upload/fetch_master/session_factory);**别写会触发真实付费 i2v 网络调用的测试**

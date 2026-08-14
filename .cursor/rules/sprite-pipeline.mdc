@@ -1,0 +1,41 @@
+---
+description: 精灵动画视频管线(参考帧→动作帧→视频→抽帧→循环→抠图→PNG序列)
+globs: backend/packages/ai_engine/**/*.py,backend/packages/framework/src/windup_framework/providers/*.py,backend/packages/app/src/windup_app/server/orchestrator/*.py
+alwaysApply: false
+---
+
+# 精灵动画视频管线
+
+六步管线**已在现有架构里端到端实现**,不要重造 image/video/loop/编排轮子。
+
+| 步骤 | 实现 |
+|---|---|
+| 1 参考帧 | `SufyImageProvider.gen_image` + `master_check`/`master_prep` |
+| 2 动作帧 i2i | `prompt/*` builders + image-to-image |
+| 3 视频 | `SufyVideoProvider.i2v`(kling,超时可 resume) |
+| 4 抽帧 | `slicing/extract.py` |
+| 5 循环检测 | `slicing/loop.py`(deskew+谐波复选,比朴素余弦窗强,别换回去) |
+| 6 抠图 | `OnnxU2NetMatteProvider`(通用) / `ColorMatteProvider`(纯色底更干净) |
+| 编排 | `ai_engine.impl.CharacterGenerator`(现役,含像素化/脚线对齐) 或 `ai_engine.sprite_pipeline.SpritePipeline`(新,手册形态) |
+
+## 本轮新增(在现有基础上补齐,非替换)
+- `ai_engine/slicing/grid.py` — 网格切分 `slice_grid_bytes` + CLI
+- `framework/providers/sufy.py` — 视频 resume:`i2v(..., sidecar=)` 超时抛 `VideoJobTimeout`(带 job_id),`resume(sidecar)` 免费续轮询
+- `framework/providers/matte.py` — `ColorMatteProvider`(Color-Matting+u2netp 混合)+ `OnnxU2NetMatteProvider.soft_mask`
+- `ai_engine/sprite_pipeline.py` — `SpritePipeline` 编排 + `pick_bg_color`/`mirror_frames` + 四子命令 CLI
+- CLI 输出统一 `Response` 形状 JSON(引擎内部仍抛异常)
+
+## 接入 orchestrator(对比测试用,默认关)
+动作任务 `POST /generation/action` 传 `use_sprite_pipeline: true` → `executor._produce_action_via_sprite`
+走 SpritePipeline + `ColorMatteProvider` + resume;`false`(默认)走现役 `CharacterGenerator`。
+新路线**不做像素化/脚线对齐**;sidecar 落 `${TMPDIR}/windup_sprite/task_{id}.json`。
+
+## CLI
+```bash
+python -m windup_ai_engine.sprite_pipeline reference|action|animate|run ...
+python -m windup_ai_engine.sprite_pipeline animate --resume --sidecar <path> -o frames/
+python -m windup_ai_engine.slicing.grid in.png -o out/ --grid 2x2 --names a,b,c,d
+python -m windup_framework.providers.matte in.png -o out.png --preview
+```
+
+参考手册:`/Users/a4/docs/asset-workflow-reference.md`(godogen asset-gen 提炼)。

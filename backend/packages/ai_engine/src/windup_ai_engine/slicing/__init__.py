@@ -9,6 +9,7 @@ loop),一次性动作裁动作区间。像素化 / 对齐 / 打包在 :mod:`..po
 """
 
 from .extract import extract_all_frames_bytes, extract_frames_bytes
+from .grid import slice_grid_bytes
 from .loop import find_period, pick_cycle
 from .oneshot import (
     find_motion_span,
@@ -22,6 +23,8 @@ from .quality import dead_frame_indices, loop_seam, motion_scale
 __all__ = [
     "extract_frames_bytes",
     "extract_all_frames_bytes",
+    # 网格切分(kit 图 → 独立 PNG;与视频抽帧同层但按空间切,见 grid 模块)
+    "slice_grid_bytes",
     "find_period",
     "pick_cycle",
     # 交付成色的三个读数(汇成 ports.ActionQuality;其余 quality.* 仍是内部诊断)

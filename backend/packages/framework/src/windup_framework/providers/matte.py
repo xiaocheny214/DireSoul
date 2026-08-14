@@ -204,6 +204,14 @@ class OnnxU2NetMatteProvider(MatteProvider):
             )
         return self._session
 
+    def soft_mask(self, img: Image.Image) -> np.ndarray:
+        """u2netp 软掩码,原图尺寸的 ``[0, 1]`` float ndarray(0=背景,1=主体)。
+
+        暴露它是为了让 :class:`ColorMatteProvider` 复用同一份 onnx 会话与前向,而不是
+        另起一套推理 —— 「主体掩码是什么」只该有一个真相源(同 :mod:`.._subject` 的理由)。
+        """
+        return np.asarray(self._predict_mask(img), dtype=np.float32) / 255.0
+
     def _predict_mask(self, img: Image.Image) -> Image.Image:
         """u2netp 前向 → 单通道显著性 mask(L,原图尺寸)。"""
         im = img.convert("RGB").resize(_SIZE, Image.LANCZOS)
@@ -231,3 +239,253 @@ class OnnxU2NetMatteProvider(MatteProvider):
         buf = io.BytesIO()
         Image.fromarray(out, "RGBA").save(buf, "PNG")
         return buf.getvalue()
+
+
+# ── Color-Matting + u2netp 混合抠图(纯色背景专用)────────────────────────────
+#
+# 与 OnnxU2NetMatteProvider 的分工:那个是「显著性抠主体」,判据是 u2netp,颜色只在闭合
+# 空隙里**做减法**;适合背景未知 / 非纯色的通用帧。本 provider 反过来:精灵管线的背景是
+# **刻意生成的纯色底**(见 asset-workflow 参考手册 2.1「不要写 transparent」),此时用合成
+# 方程 pixel = α·fg + (1-α)·bg 能从物理上算出 α 的下限,把半透明边缘、发丝这类 u2netp 会
+# 一刀切硬边的地方还原成软过渡,并**反合成消掉被底色污染的边缘像素**(去彩色光环 fringing)。
+# u2netp 软掩码只用来判「这块到底算不算主体」(三态 regime),不单独决定 α。
+
+# 三态判定阈值(mask 前景占比)。低于 MIN → mask 失败,只信 Color Matting;高于 MAX →
+# mask 把背景也圈进来了(泄漏),转自适应;之间 → 信 mask。与 asset-workflow 手册 5.2 一致。
+_MASK_MIN_PCT = 5.0
+_MASK_MAX_PCT = 70.0
+_MASK_MIN_PX = 100
+
+# 各 regime 的默认阈值(bg_thresh 越低越激进去背景;fg_thresh 越高越保护前景)。
+_REGIME_DEFAULTS: dict[str, dict[str, float]] = {
+    "trust": {"bg_thresh": 0.05, "fg_thresh": 1.0},   # 信 mask:mask 前景一律保留
+    "adapt": {"bg_thresh": 0.05, "fg_thresh": 0.20},  # 自适应:阈值由 mask 值插值
+    "color": {"bg_thresh": 0.10, "fg_thresh": 0.10},  # 只有 Color Matting
+}
+_REGIMES = ("auto", "trust", "adapt", "color")
+
+
+def sample_bg_color(img: np.ndarray, block: int = 2) -> np.ndarray:
+    """四角各取 ``block×block`` 块的平均色作为背景色。
+
+    Args:
+        img: RGB 图像 ``(H, W, 3)`` float,取值 ``[0, 1]``。
+        block: 角落采样块边长。
+
+    Returns:
+        ``(3,)`` 平均背景色。
+
+    取四角是「纯色底四角必是背景」这条几何假设;主体一般不顶到四个角。取平均(不是中位)
+    是因为块本身已很小、且这里要的是 Color Matting 的基准色,轻微噪声用均值即可。
+    """
+    corners = np.concatenate([
+        img[:block, :block].reshape(-1, 3),
+        img[:block, -block:].reshape(-1, 3),
+        img[-block:, :block].reshape(-1, 3),
+        img[-block:, -block:].reshape(-1, 3),
+    ])
+    return corners.mean(axis=0)
+
+
+def compute_alpha_color(img: np.ndarray, bg_color: np.ndarray) -> np.ndarray:
+    """由合成方程反解每个像素 α 的**物理下限**。
+
+    合成方程 ``pixel_c = α·fg_c + (1-α)·bg_c``。对未知 fg 取两个极端(fg=1 与 fg=0)分别得
+    ``α >= (pixel_c - bg_c)/(1 - bg_c)`` 与 ``α >= (bg_c - pixel_c)/bg_c``,逐通道取最大即下限。
+
+    Args:
+        img: RGB ``(H, W, 3)`` float ``[0, 1]``。
+        bg_color: ``(3,)`` 背景色 ``[0, 1]``。
+
+    Returns:
+        ``(H, W)`` α 下限,``[0, 1]``。
+
+    分母接近 0(背景某通道接近 0 或 1)时该通道贡献不可靠,用 0.05 的余量跳过,避免除爆。
+    """
+    diff = img - bg_color[None, None, :]
+    alpha = np.zeros(img.shape[:2], dtype=np.float64)
+    for c in range(3):
+        if 1.0 - bg_color[c] > 0.05:
+            alpha = np.maximum(alpha, np.maximum(diff[:, :, c], 0) / (1.0 - bg_color[c]))
+        if bg_color[c] > 0.05:
+            alpha = np.maximum(alpha, np.maximum(-diff[:, :, c], 0) / bg_color[c])
+    return np.clip(alpha, 0.0, 1.0)
+
+
+def recover_foreground(img: np.ndarray, alpha: np.ndarray, bg_color: np.ndarray) -> np.ndarray:
+    """反合成还原前景真实色 ``fg = (pixel - (1-α)·bg) / α``,消除边缘的背景色残留。
+
+    Args:
+        img: RGB ``(H, W, 3)`` float ``[0, 1]``。
+        alpha: ``(H, W)`` ``[0, 1]``。
+        bg_color: ``(3,)``。
+
+    Returns:
+        还原后的前景 ``(H, W, 3)`` ``[0, 1]``。
+
+    α 接近 0 处除法会放大噪声,故 α<0.02 的像素直接判黑(它们几乎全透明,颜色不会被看到)。
+    """
+    a = alpha[:, :, np.newaxis]
+    bg = bg_color[np.newaxis, np.newaxis, :]
+    safe_a = np.where(a > 0.02, a, 1.0)
+    fg = np.clip((img - (1.0 - a) * bg) / safe_a, 0.0, 1.0)
+    fg[alpha < 0.02] = 0.0
+    return fg
+
+
+def detect_regime(mask_soft: np.ndarray) -> str:
+    """按 u2netp 软掩码的前景覆盖率选抠图模式:``trust`` / ``adapt`` / ``color``。"""
+    mask_fg = int((mask_soft > 0.5).sum())
+    pct = mask_fg / mask_soft.size * 100
+    if mask_fg < _MASK_MIN_PX or pct < _MASK_MIN_PCT:
+        return "color"
+    if pct > _MASK_MAX_PCT:
+        return "adapt"
+    return "trust"
+
+
+class ColorMatteProvider(MatteProvider):
+    """纯色背景专用的 Color-Matting + u2netp 混合抠图。frame bytes → RGBA PNG bytes。
+
+    实现 :class:`~.interfaces.MatteProvider`,可与 :class:`OnnxU2NetMatteProvider` 互换注入。
+    复用后者的 onnx 会话取软掩码(不另起推理);α 由 Color Matting 的物理下限主导,mask 只
+    决定三态 regime。适用于精灵管线这类**背景是刻意生成的纯色**的场景。
+
+    使用示例::
+
+        provider = ColorMatteProvider()
+        clean_png = provider.cutout(frame_png)          # RGBA,边缘干净
+        qa_png = provider.preview(frame_png)            # 对比色背景合成图,肉眼查透明度
+    """
+
+    def __init__(
+        self,
+        mask_provider: OnnxU2NetMatteProvider | None = None,
+        *,
+        regime: str = "auto",
+        bg_thresh: float | None = None,
+        fg_thresh: float | None = None,
+    ) -> None:
+        if regime not in _REGIMES:
+            raise ValueError(f"regime 须是 {_REGIMES} 之一,收到 {regime!r}")
+        # 默认自建一个 u2netp provider 取软掩码;传入可复用已加载的会话(批量模式省一次装载)。
+        self._mask = mask_provider or OnnxU2NetMatteProvider()
+        self._regime = regime
+        self._bg_thresh = bg_thresh
+        self._fg_thresh = fg_thresh
+
+    def _rgba(self, frame: bytes) -> tuple[np.ndarray, np.ndarray]:
+        """解码 → (RGB float[0,1], u2netp 软掩码[0,1])。两者同尺寸。"""
+        img = Image.open(io.BytesIO(frame)).convert("RGB")
+        rgb = np.asarray(img, dtype=np.float64) / 255.0
+        mask = self._mask.soft_mask(img).astype(np.float64)
+        return rgb, mask
+
+    def _matte(self, rgb: np.ndarray, mask_soft: np.ndarray,
+               bg_color_override: np.ndarray | None = None) -> np.ndarray:
+        """核心抠图:RGB + 软掩码 → RGBA uint8。见类 docstring 的算法说明。"""
+        bg_color = bg_color_override if bg_color_override is not None else sample_bg_color(rgb)
+        alpha_color = compute_alpha_color(rgb, bg_color)
+
+        regime = detect_regime(mask_soft) if self._regime == "auto" else self._regime
+        d = _REGIME_DEFAULTS[regime]
+        bt = self._bg_thresh if self._bg_thresh is not None else d["bg_thresh"]
+        ft = self._fg_thresh if self._fg_thresh is not None else d["fg_thresh"]
+
+        if regime == "color":
+            alpha = alpha_color
+        elif regime == "trust":
+            # 信 mask:mask 判为前景(>0.05)的地方 α 至少取到 mask 值,从不因 Color Matting 抹掉
+            is_bg = (alpha_color < bt) | (mask_soft < 0.05)
+            alpha = np.where(is_bg, alpha_color, np.maximum(alpha_color, mask_soft))
+        else:  # adapt:阈值随 mask 值在 [bt, ft] 间插值,mask 前景也可被判背景(治泄漏)
+            thresh = bt + mask_soft * (ft - bt)
+            is_bg = alpha_color < thresh
+            alpha = np.where(is_bg, alpha_color, np.maximum(alpha_color, mask_soft))
+
+        alpha = alpha.copy()
+        alpha[alpha < 0.01] = 0.0
+        fg = recover_foreground(rgb, alpha, bg_color)
+
+        h, w = rgb.shape[:2]
+        out = np.zeros((h, w, 4), dtype=np.uint8)
+        out[:, :, :3] = (fg * 255).clip(0, 255).astype(np.uint8)
+        out[:, :, 3] = (alpha * 255).clip(0, 255).astype(np.uint8)
+        return out
+
+    def cutout(self, frame: bytes) -> bytes:
+        """移除纯色背景,返回 RGBA PNG bytes(实现 MatteProvider 契约)。"""
+        rgb, mask = self._rgba(frame)
+        out = self._matte(rgb, mask)
+        buf = io.BytesIO()
+        Image.fromarray(out, "RGBA").save(buf, "PNG")
+        return buf.getvalue()
+
+    def preview(self, frame: bytes, bg: tuple[int, int, int] = (255, 0, 255)) -> bytes:
+        """QA 预览:把抠图结果合成到对比色(默认品红)背景上,返回 RGB PNG bytes。
+
+        肉眼查透明度的唯一可靠方式 —— 从裸 RGBA 看不出边缘残留 / 抠穿,合成到对比色上一眼可见。
+        """
+        rgb, mask = self._rgba(frame)
+        rgba = self._matte(rgb, mask)
+        cut = Image.fromarray(rgba, "RGBA")
+        canvas = Image.new("RGBA", cut.size, (*bg, 255))
+        canvas.alpha_composite(cut)
+        buf = io.BytesIO()
+        canvas.convert("RGB").save(buf, "PNG")
+        return buf.getvalue()
+
+
+def _main() -> int:
+    """CLI:单帧 / 批量抠纯色背景,输出统一 ``Response`` 形状 JSON。"""
+    import argparse
+    from pathlib import Path
+
+    from windup_common.result import Response
+
+    p = argparse.ArgumentParser(description="Color-Matting + u2netp 混合抠图(纯色背景)")
+    p.add_argument("input", nargs="?", help="单帧输入图路径(与 --batch 二选一)")
+    p.add_argument("-o", "--output", required=True, help="单帧输出 PNG 路径,或 --batch 时的输出目录")
+    p.add_argument("--batch", metavar="DIR", help="批量模式:处理目录下所有 PNG(BiRefNet/u2netp 只加载一次)")
+    p.add_argument("-m", "--mode", default="auto", choices=_REGIMES, help="抠图模式(默认 auto)")
+    p.add_argument("--bg-thresh", type=float, default=None, help="背景阈值(越低越激进)")
+    p.add_argument("--fg-thresh", type=float, default=None, help="前景阈值(越高越保护)")
+    p.add_argument("--preview", action="store_true", help="额外生成 _qa.png(对比色背景合成,查透明度)")
+    args = p.parse_args()
+
+    provider = ColorMatteProvider(regime=args.mode, bg_thresh=args.bg_thresh, fg_thresh=args.fg_thresh)
+
+    try:
+        if args.batch:
+            src_dir, out_dir = Path(args.batch), Path(args.output)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            done = []
+            for src in sorted(src_dir.glob("*.png")):
+                (out_dir / src.name).write_bytes(provider.cutout(src.read_bytes()))
+                if args.preview:
+                    (out_dir / f"{src.stem}_qa.png").write_bytes(provider.preview(src.read_bytes()))
+                done.append(str(out_dir / src.name))
+            print(Response.success({"count": len(done), "paths": done}).model_dump_json())
+            return 0
+
+        if not args.input:
+            print(Response.fail("单帧模式需给 input(或用 --batch)", code=400).model_dump_json())
+            return 2
+        data = Path(args.input).read_bytes()
+        out_path = Path(args.output)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(provider.cutout(data))
+        result = {"path": str(out_path)}
+        if args.preview:
+            qa = out_path.with_name(f"{out_path.stem}_qa.png")
+            qa.write_bytes(provider.preview(data))
+            result["qa"] = str(qa)
+        print(Response.success(result).model_dump_json())
+        return 0
+    except (OSError, ValueError, RuntimeError) as exc:
+        print(Response.fail(str(exc), code=500).model_dump_json())
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

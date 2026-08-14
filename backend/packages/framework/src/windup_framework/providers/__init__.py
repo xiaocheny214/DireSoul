@@ -8,10 +8,11 @@ from windup_framework.providers.interfaces import (
     MatteProvider,
     VideoProvider,
 )
-from windup_framework.providers.matte import OnnxU2NetMatteProvider
+from windup_framework.providers.matte import ColorMatteProvider, OnnxU2NetMatteProvider
 from windup_framework.providers.sufy import (
     SufyImageProvider,
     SufyVideoProvider,
+    VideoJobTimeout,
 )
 from windup_framework.providers.video import create_video_client
 
@@ -26,7 +27,11 @@ __all__ = [
     "MatteProvider",
     # 实现
     "SufyVideoProvider",
+    # i2v 轮询超时(未失败)—— 携 job_id,配合 sidecar 可免费 resume
+    "VideoJobTimeout",
     # FAL 队列面的 i2v(现役接口形态);首帧要公网 URL,故与 uploader 成对出现
     "SufyImageProvider",
     "OnnxU2NetMatteProvider",
+    # 纯色背景专用的 Color-Matting + u2netp 混合抠图(边缘更干净)
+    "ColorMatteProvider",
 ]

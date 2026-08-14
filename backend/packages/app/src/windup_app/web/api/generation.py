@@ -183,6 +183,9 @@ class CharacterActionGenerateRequest(BaseModel):
     # 视频模型。None = 用部署默认(kling-v2-5-turbo)。取值域见
     # orchestrator.executor.ALLOWED_VIDEO_MODELS;非法值在入口就报错,不到付费调用才失败。
     video_model: str | None = None
+    # 是否走新的 SpritePipeline(Color-Matting 抠图 + 超时可 resume)做**对比测试**;
+    # 默认 False 走现役 CharacterGenerator。见 CharacterActionInput.use_sprite_pipeline。
+    use_sprite_pipeline: bool = False
 
     @model_validator(mode="after")
     def require_custom_prompt(self):
@@ -328,6 +331,9 @@ def submit_action_generation(
         custom_prompt=body.custom_prompt,
         loop=body.loop,
         video_model=body.video_model,
+        # 临时:强制走新 SpritePipeline 做实测,前端 payload 无需改动。
+        # 回退只需改回 body.use_sprite_pipeline。
+        use_sprite_pipeline=True,
         reference_video_url=body.reference_video_url,
         reference_image_urls=body.reference_image_urls,
         num_frames=body.num_frames,

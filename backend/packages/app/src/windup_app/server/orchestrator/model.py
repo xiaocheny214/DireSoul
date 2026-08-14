@@ -78,6 +78,11 @@ class CharacterActionInput:
     # 取值域见 executor.ALLOWED_VIDEO_MODELS —— 只开放两个,因为每个模型的入参形状不同
     # (image_list / input_reference / Fal 队列),全开等于把三套协议适配塞进一个改动。
     video_model: str | None = None
+    # 走哪条动作生成引擎。``False``(默认)= 现役 CharacterGenerator(母版→i2v→抽帧→循环→
+    # u2netp 抠图→像素化/脚线对齐,按 canvas 出帧);``True`` = 新的 SpritePipeline
+    # (母版→i2v→抽帧→循环→**Color-Matting 混合抠图**→按项目尺寸缩放,超时可 resume)。
+    # 加成开关而非直接替换:现役路线是实测挣得的稳定通路,新管线供**并排对比测试**,默认不动它。
+    use_sprite_pipeline: bool = False
 
 
 # -- 出参（按任务类型细化，前端可直接回填 character 模块）------------------

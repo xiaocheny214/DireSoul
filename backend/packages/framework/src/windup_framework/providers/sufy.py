@@ -10,6 +10,11 @@
 
 2026-07-27 对 kling-v2-5-turbo 端到端实测到 completed。
 
+**可恢复性(resume)**:i2v 的钱在**提交**那一刻就产生,而 kling 实测常「卡在 99%」
+超过轮询预算。为此提交成功后可把 ``job_id`` 落到 sidecar JSON;轮询超时(未失败)时
+保留 sidecar 并抛 :class:`VideoJobTimeout`,调用方随后用 :meth:`SufyVideoProvider.resume`
+对**同一任务**继续 GET(幂等、不再计费)。相比之下重新提交等于再付一次钱。
+
 图像走 OpenAI 兼容的 ``/chat/completions``(:class:`SufyImageProvider`),参考图以 data URI
 塞进 ``content`` 数组 —— 与视频的提交-轮询-下载三段式完全不同的调用形状。
 
@@ -29,6 +34,7 @@ import io
 import json
 import logging
 import math
+from pathlib import Path
 import re
 import time
 
@@ -43,6 +49,44 @@ logger = logging.getLogger("windup.providers.sufy")
 # 只有 kling-video-o1 走 image_list;v2 系列 / sora 走 input_reference(字段按模型选,塞错任务会 failed)。
 _IMAGE_LIST_MODELS = ("kling-video-o1",)
 DEFAULT_VIDEO_MODEL = "kling-v2-5-turbo"
+
+
+class VideoJobTimeout(RuntimeError):
+    """i2v 任务在预算轮询次数内**尚未** completed(也没 failed)—— 大概率还在跑。
+
+    为什么单列一个异常而不是复用 ``RuntimeError``:i2v 的钱在**提交**那一刻就产生了,
+    kling 实测常出现「卡在 99%」需要更久才收敛的情况。原实现超时就抛一个笼统的
+    RuntimeError 并**丢掉 job_id**,于是唯一的补救只剩「重新提交 = 再付一次钱」。
+    本异常携带 ``job_id``,配合 sidecar 让调用方能对**同一个任务**继续轮询
+    (``SufyVideoProvider.resume``),而续轮询是对已提交任务的 GET,不再计费。
+
+    与 ``RuntimeError``(status==failed/cancelled)的分工:那是任务**已确定失败**、
+    重试要重新付费;这个是**尚未有结论**、resume 免费。调用方据类型二选一,别混。
+    """
+
+    def __init__(self, job_id: str, sidecar: Path | None = None) -> None:
+        hint = f";可 resume(sidecar={sidecar})" if sidecar else ""
+        super().__init__(f"i2v 任务 {job_id} 轮询预算耗尽仍未完成(未失败){hint}")
+        self.job_id = job_id
+        self.sidecar = sidecar
+
+
+def _write_sidecar(path: Path, payload: dict) -> None:
+    """把任务凭据落到 sidecar JSON,供超时后 resume 用(免费续轮询的唯一依据)。
+
+    先写临时文件再 ``replace`` 原子落地:超时那一刻若正好半写,resume 读到残缺 JSON
+    就等于把「本可免费恢复」变成「读不出 job_id、只能重新付费」。
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _read_sidecar(path: Path) -> dict:
+    if not path.exists():
+        raise FileNotFoundError(f"sidecar 不存在:{path}(任务凭据丢失,无法 resume)")
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def _fit_first_frame(frame: bytes, size: str) -> bytes:
@@ -102,9 +146,13 @@ class SufyVideoProvider(VideoProvider):
             timeout=self._cfg.timeout,
         )
 
-    def i2v(
-        self, first_frame: bytes, prompt: str, seconds: int = 5, size: str = "1280x720"
-    ) -> bytes:
+    def _budget(self) -> int:
+        """一次 i2v 轮询的最大次数(至少 1)。抽成方法,让 i2v 与 resume 用同一预算。"""
+        return max(1, int(self._max_min * 60 // self._poll))
+
+    def _submit(self, client: httpx.Client, first_frame: bytes, prompt: str,
+                seconds: int, size: str) -> str:
+        """提交 i2v 任务,返回 job_id。**这一步一产生就开始计费。**"""
         body: dict = {
             "model": self._model,
             "prompt": prompt,
@@ -117,24 +165,88 @@ class SufyVideoProvider(VideoProvider):
             body["image_list"] = [{"image": b64}]
         else:
             body["input_reference"] = _first_frame_datauri(first_frame, size)
+        job = client.post("/videos", json=body).raise_for_status().json()
+        jid = job.get("id")
+        if not jid:
+            raise RuntimeError(f"i2v 提交未返回 job id:{job}")
+        return str(jid)
 
+    def _poll(self, client: httpx.Client, job_id: str, budget: int) -> str | None:
+        """轮询一个**已提交**任务,返回成品 URL;仍在跑返回 ``None``;已失败抛错。
+
+        对已提交任务的 GET 幂等、不再计费,所以 resume 与 i2v 首轮都走这里。
+        """
+        for _ in range(budget):
+            time.sleep(self._poll)
+            st = client.get(f"/videos/{job_id}").raise_for_status().json()
+            status = st.get("status")
+            if status == "completed":
+                vids = (st.get("task_result") or {}).get("videos") or []
+                return vids[0].get("url") if vids else None
+            if status in ("failed", "cancelled"):
+                # 已确定失败:重试要重新付费,与「尚未有结论」不是一回事,故抛普通 RuntimeError
+                raise RuntimeError(f"i2v 失败: {status} — {st.get('error')}")
+        return None
+
+    def i2v(
+        self,
+        first_frame: bytes,
+        prompt: str,
+        seconds: int = 5,
+        size: str = "1280x720",
+        *,
+        sidecar: str | Path | None = None,
+    ) -> bytes:
+        """首帧 + prompt → mp4 bytes。
+
+        Args:
+            first_frame / prompt / seconds / size: 见 ``VideoProvider.i2v`` 契约。
+            sidecar: 可选的任务凭据落盘路径。给了它,提交成功后立刻把 ``job_id`` 写进去;
+                轮询预算内完成则删除 sidecar 并返回视频;**超时(未失败)则保留 sidecar 并抛
+                :class:`VideoJobTimeout`**,调用方随后可用 :meth:`resume` 对同一任务免费续轮询。
+                不给 sidecar 时行为与旧版一致:超时抛 ``VideoJobTimeout``、但无处可 resume。
+
+        Raises:
+            VideoJobTimeout: 轮询预算耗尽仍未完成(任务大概率还在跑,可 resume)。
+            RuntimeError: 任务确定失败 / 取消,或成品下载失败(重试要重新付费)。
+        """
+        sc = Path(sidecar) if sidecar else None
         with self._client() as client:
-            job = client.post("/videos", json=body).raise_for_status().json()
-            jid = job.get("id")
-            url = None
-            for _ in range(max(1, int(self._max_min * 60 // self._poll))):
-                time.sleep(self._poll)
-                st = client.get(f"/videos/{jid}").raise_for_status().json()
-                status = st.get("status")
-                if status == "completed":
-                    vids = (st.get("task_result") or {}).get("videos") or []
-                    url = vids[0].get("url") if vids else None
-                    break
-                if status in ("failed", "cancelled"):
-                    raise RuntimeError(f"i2v 失败: {status} — {st.get('error')}")
+            jid = self._submit(client, first_frame, prompt, seconds, size)
+            if sc is not None:
+                _write_sidecar(sc, {
+                    "job_id": jid, "model": self._model,
+                    "submitted_at": _utc_now().isoformat(),
+                })
+            url = self._poll(client, jid, self._budget())
             if not url:
-                raise RuntimeError("i2v 未取得视频 URL(超时或失败)")
-            return _download(client, url)
+                # 未 completed 也未 failed = 还在跑。保留 sidecar 让 resume 免费接手。
+                raise VideoJobTimeout(jid, sidecar=sc)
+            data = _download(client, url)
+        if sc is not None:
+            sc.unlink(missing_ok=True)     # 成品已到手,凭据可弃(留着会让 resume 误以为还有活)
+        return data
+
+    def resume(self, sidecar: str | Path) -> bytes:
+        """对 sidecar 记录的**已提交**任务继续轮询,拿到成品 mp4 bytes。
+
+        这是对 :class:`VideoJobTimeout` 的补救:任务钱早已花掉、还在跑,resume 只是继续 GET
+        它的状态(幂等、不计费),completed 后下载。成功即删 sidecar。
+
+        Raises:
+            FileNotFoundError: sidecar 不存在(凭据丢失,只能重新提交 = 重新付费)。
+            VideoJobTimeout: 又一轮预算耗尽仍未完成(可继续 resume)。
+            RuntimeError: 任务已失败 / 取消,或成品下载失败。
+        """
+        sc = Path(sidecar)
+        jid = str(_read_sidecar(sc)["job_id"])
+        with self._client() as client:
+            url = self._poll(client, jid, self._budget())
+            if not url:
+                raise VideoJobTimeout(jid, sidecar=sc)
+            data = _download(client, url)
+        sc.unlink(missing_ok=True)
+        return data
 
 
 class IncompleteDownloadError(RuntimeError):

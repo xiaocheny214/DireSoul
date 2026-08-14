@@ -31,15 +31,37 @@ class StorageSettings(BaseSettings):
     download_expires: int = 3600
     # 可选;不填则 SDK 自动查询 bucket 所在区域(z0=华东 z1=华北 z2=华南 na0=北美 as0=东南亚)
     region: str | None = None
+    # 仅本地测试:七牛测试域名(如 *.hd-bkt.clouddn.com)没有匹配的 HTTPS 证书,
+    # 用 https 拉图会 CERTIFICATE_VERIFY_FAILED(主机名不匹配)。置 1 时下载域名走 http。
+    # 默认关闭,生产必须绑定有合法证书的 HTTPS 域名。
+    insecure_http: bool = False
 
     @property
     def download_base(self) -> str:
-        """返回浏览器可访问的下载域名。"""
-        domain = self.bucket_domain.rstrip("/")
-        if domain.startswith("http://"):
-            raise ValueError("QINIU_BUCKET_DOMAIN 必须使用 HTTPS 下载域名")
-        if domain and not domain.startswith("https://"):
-            domain = f"https://{domain}"
+        """返回可访问的下载域名前缀。
+
+        默认强制 HTTPS。仅当 ``QINIU_INSECURE_HTTP=1``(本地测试)时改走 HTTP —— 七牛测试
+        域名的通配证书只覆盖一级标签,多一级的子域名(``xxx.hd-bkt.clouddn.com``)握手必然
+        主机名不匹配,本质上只能走 HTTP。
+        """
+        raw = self.bucket_domain.rstrip("/")
+        if not raw:
+            return ""
+        # 去掉可能已带的 scheme,统一按开关决定的 scheme 重新拼,避免 http/https 混用。
+        host_part = raw
+        for prefix in ("https://", "http://"):
+            if host_part.startswith(prefix):
+                host_part = host_part[len(prefix):]
+                break
+        if self.insecure_http:
+            domain = f"http://{host_part}"
+        else:
+            if raw.startswith("http://"):
+                raise ValueError(
+                    "QINIU_BUCKET_DOMAIN 必须使用 HTTPS 下载域名;"
+                    "本地测试如需走 HTTP,请设 QINIU_INSECURE_HTTP=1"
+                )
+            domain = f"https://{host_part}"
         hostname = (urlsplit(domain).hostname or "").lower()
         labels = hostname.split(".")
         if hostname.endswith(".qiniucs.com") and any(

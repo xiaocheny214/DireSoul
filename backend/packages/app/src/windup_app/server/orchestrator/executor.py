@@ -26,6 +26,7 @@ from windup_common.models import ActionSpec, ActionType as EngineActionType, Cha
 from windup_app.server.orchestrator import task_repo
 from windup_app.server.orchestrator._fetch import fetch_own_media
 from windup_app.server.orchestrator.model import (
+    ActionType,
     CharacterActionInput,
     CharacterImageInput,
     TaskStatus,
@@ -33,6 +34,7 @@ from windup_app.server.orchestrator.model import (
 
 if TYPE_CHECKING:
     from windup_ai_engine.ports import CharacterGeneratorPort, ProgressPort
+    from windup_ai_engine.sprite_pipeline import SpritePipeline
     from windup_framework.providers import ImageProvider, MatteProvider
 
 logger = logging.getLogger("windup.generation.executor")
@@ -183,6 +185,7 @@ class ActionTaskExecutor:
         self,
         *,
         generator: CharacterGeneratorPort | None = None,
+        sprite_pipeline: SpritePipeline | None = None,
         upload: Callable[[bytes], str] | None = None,
         fetch_master: Callable[[CharacterActionInput], bytes] | None = None,
         fetch_constraints: Callable[[Session, int | None], ProjectConstraints] | None = None,
@@ -191,6 +194,10 @@ class ActionTaskExecutor:
         self._generator = generator          # None → 懒加载真实装配
         # 按视频模型名分桶的 generator 缓存(模型是 provider 的构造参数,不能事后换)
         self._by_model: dict[str | None, CharacterGeneratorPort] = {}
+        # 新 SpritePipeline(对比测试用):注入则固定用它,否则按视频模型名懒装配分桶。
+        self._sprite_pipeline = sprite_pipeline
+        self._sprite_by_model: dict[str | None, SpritePipeline] = {}
+        self._color_matte: MatteProvider | None = None   # SpritePipeline 用的 Color-Matting 抠图
         # 抠图 / 图生图 provider 与视频模型无关,所有模型桶共用一份:每个抠图实例都会
         # 各自惰性加载一份 ONNX 会话,按桶各建等于把同一个模型在进程里装多次。
         self._matte: MatteProvider | None = None
@@ -224,7 +231,10 @@ class ActionTaskExecutor:
                 session.commit()
 
             cons = (self._fetch_constraints or _load_constraints)(session, project_id)
-            result = self._produce_action(input, cons)
+            if input.use_sprite_pipeline:
+                result = self._produce_action_via_sprite(task_id, input, cons)
+            else:
+                result = self._produce_action(input, cons)
             task_repo.update_result(session, task_id, _ACTION_RESULT, result)
             if own:
                 session.commit()
@@ -293,6 +303,146 @@ class ActionTaskExecutor:
             for i, (png, dur) in enumerate(zip(generated.frames, generated.durations))
         ]
         return {"type": "character_action", "action_type": input.action_type.value, "frames": frames}
+
+    # ── 新 SpritePipeline 路线(对比测试)──────────────────────────────────────
+    def _produce_action_via_sprite(
+        self, task_id: int, input: CharacterActionInput, cons: ProjectConstraints
+    ) -> dict:
+        """走 SpritePipeline。**按帧数分两条**:
+
+        - ``num_frames==1``(动作首帧):只跑第 2 步 image-to-image 动作帧,**不调视频模型**。
+          首帧是给用户确认姿态、并作为完整动画 i2v 种子图的那张,故保留纯色底、不抠图不缩放。
+        - ``num_frames>1``(完整动画):母版→i2v→抽帧→循环→Color-Matting 抠图→按项目尺寸缩放。
+
+        与 ``_produce_action`` 的差别只在**引擎与抠图**:这里用 SpritePipeline +
+        ``ColorMatteProvider``(纯色底边缘更干净),并支持视频超时后按 sidecar resume;
+        像素化 / 脚线对齐现役路线才有,本路线按手册「干净 PNG 序列」的形态交付,故只做
+        尺寸缩放。母版预处理(jump/attack 补顶部空间)与提示词构建**复用现役实现**,
+        保证两条路线是同样的输入、只对比后半段的产出差异。
+        """
+        from pathlib import Path
+        import tempfile
+
+        from windup_ai_engine.master_prep import prepare_master
+
+        master = (self._fetch_master or self._download_master)(input)
+        action_value = _to_engine_action(input.action_type).value
+        prompt = self._sprite_prompt(input, cons)
+        pipe = self._get_sprite_pipeline(_resolve_video_model(input.video_model))
+
+        # 首帧(num_frames==1)只跑第 2 步 image-to-image 动作帧,**不调视频模型**。
+        # 首帧的双重用途决定了它既不抠图也不缩放:①给用户确认动作姿态的预览;②被完整动画
+        # 当作 i2v 的种子图(complete 路线 fetch 的 reference_image_urls[0] 正是这张)。抠成透明底
+        # 会毁掉 i2v 种子,缩到精灵尺寸(如 256)会让种子分辨率过低、出视频糊 —— 故原样交付。
+        # 也不做 prepare_master:补顶空间是给视频运动留余量的,留到 complete 路线只补一次。
+        if input.num_frames == 1:
+            upload = self._upload or self._upload_frame
+            frame = pipe.generate_action_frame(master, prompt)
+            return {
+                "type": "character_action",
+                "action_type": input.action_type.value,
+                "frames": [{"index": 0, "image_url": upload(frame), "duration_ms": None}],
+            }
+
+        framed = prepare_master(master, action_value)          # jump/attack 补顶部空间,余原样
+        cyclic, kind = self._sprite_cyclic_kind(input)
+
+        # sidecar 按 task_id 命名:视频超时(未失败)时凭据留在这里,可用
+        # `python -m windup_ai_engine.sprite_pipeline animate --resume --sidecar <此路径>` 续跑。
+        sidecar = Path(tempfile.gettempdir()) / "windup_sprite" / f"task_{task_id}.json"
+        frames = pipe.animate(
+            framed, prompt,
+            n_frames=input.num_frames, cyclic=cyclic, seconds=5, kind=kind, sidecar=str(sidecar),
+        )
+
+        durations = self._sprite_durations(action_value, len(frames))
+        upload = self._upload or self._upload_frame
+        out_frames = [
+            {"index": i,
+             "image_url": upload(_fit_to(png, cons.sprite_w, cons.sprite_h, smooth=True)),
+             "duration_ms": dur}
+            for i, (png, dur) in enumerate(zip(frames, durations))
+        ]
+        return {"type": "character_action", "action_type": input.action_type.value, "frames": out_frames}
+
+    @staticmethod
+    def _sprite_prompt(input: CharacterActionInput, cons: ProjectConstraints) -> str:
+        """按动作类型 + 项目朝向选提示词,**复用现役 prompt 构建器**(不另写一套)。"""
+        from windup_ai_engine.prompt import (
+            build_attack_prompt,
+            build_custom_prompt,
+            build_idle_prompt,
+            build_jump_prompt,
+            build_walk_prompt,
+        )
+        from windup_common.models import Facing
+
+        facing = Facing(cons.facing)
+        if input.action_type is ActionType.CUSTOM:
+            return build_custom_prompt(
+                input.custom_prompt or "", facing=facing, cyclic=bool(input.loop)
+            )
+        builders = {
+            ActionType.IDLE: build_idle_prompt,
+            ActionType.JUMP: build_jump_prompt,
+            ActionType.ATTACK: build_attack_prompt,
+        }
+        return builders.get(input.action_type, build_walk_prompt)(facing=facing)
+
+    @staticmethod
+    def _sprite_cyclic_kind(input: CharacterActionInput) -> tuple[bool, str]:
+        """(是否循环, 一次性抽帧判据)。循环性与现役 ROUTE/CYCLIC 约定一致。"""
+        if input.action_type is ActionType.CUSTOM:
+            # 缺 loop 兜成一次性,与现役 executor 同口径(失败代价不对称)。
+            cyclic = False if input.loop is None else bool(input.loop)
+        else:
+            cyclic = input.action_type in (ActionType.WALK, ActionType.IDLE)
+        kind = "airborne" if input.action_type is ActionType.JUMP else "swing"
+        return cyclic, kind
+
+    @staticmethod
+    def _sprite_durations(action_value: str, n: int) -> list[int | None]:
+        """逐帧时长(ms),复用现役 frame_durations;取不到就给 None(帧仍可交付)。"""
+        try:
+            from windup_ai_engine.postprocess import frame_durations
+
+            return list(frame_durations(action_value, n))
+        except Exception:  # noqa: BLE001 —— 时长取不到不该阻断已生成好的帧
+            return [None] * n
+
+    def _get_sprite_pipeline(self, video_model: str | None = None) -> SpritePipeline:
+        """懒装配 SpritePipeline,按视频模型名分桶(模型是 provider 构造参数)。
+
+        注入了 ``sprite_pipeline`` 则固定用它(测试用桩)。抠图统一用一份共享的
+        ``ColorMatteProvider``(它内部复用同一 onnx 会话),图生图 provider 与现役路线共用。
+        """
+        if self._sprite_pipeline is not None:
+            return self._sprite_pipeline
+        cached = self._sprite_by_model.get(video_model)
+        if cached is not None:
+            return cached
+        with self._assembly_lock:
+            cached = self._sprite_by_model.get(video_model)
+            if cached is None:
+                from windup_ai_engine.sprite_pipeline import SpritePipeline
+                from windup_framework.providers import (
+                    ColorMatteProvider,
+                    SufyImageProvider,
+                    SufyVideoProvider,
+                )
+
+                if self._image is None:
+                    self._image = SufyImageProvider()
+                if self._color_matte is None:
+                    self._color_matte = ColorMatteProvider()
+                cached = SpritePipeline(
+                    image=self._image,
+                    video=SufyVideoProvider(model=video_model),
+                    matte=self._color_matte,
+                    progress=_LogProgress(),
+                )
+                self._sprite_by_model[video_model] = cached
+            return cached
 
     def _get_generator(self, video_model: str | None = None) -> CharacterGeneratorPort:
         """懒装配 CharacterGenerator,按模型名分桶。
